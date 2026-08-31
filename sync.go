@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -41,6 +43,16 @@ func loadForkConfig(repo string) (forkConfig, error) {
 	return c, nil
 }
 
+// hasRepoFork reports whether the repo itself (not just subdirectories of it)
+// is registered as a fork.
+func hasRepoFork(repo string) bool {
+	if v, _ := gitConfigGet(repo, "fork.upstream"); v != "" {
+		return true
+	}
+	v, _ := gitConfigGet(repo, "fork.upstreamRemote")
+	return v != ""
+}
+
 // syncResult captures the outcome of syncing one repo for the summary table.
 type syncResult struct {
 	Repo   string
@@ -54,8 +66,10 @@ type syncOptions struct {
 }
 
 // syncOne runs the full sync pipeline for a single repo.
-func syncOne(repo string, opt syncOptions) syncResult {
-	res := syncResult{Repo: repo}
+// The result is named so the deferred stash-pop below can append its warning
+// to a result that has already been assigned by a `return res` statement.
+func syncOne(repo string, opt syncOptions) (res syncResult) {
+	res = syncResult{Repo: repo}
 
 	cfg, err := loadForkConfig(repo)
 	if err != nil {
@@ -94,9 +108,15 @@ func syncOne(repo string, opt syncOptions) syncResult {
 	}
 	upstreamRef := cfg.Remote + "/" + cfg.Branch
 
+	patterns := loadIgnorePatterns(repo, repo, "fork.ignore")
+
 	if dryRun {
 		res.Status = "dry-run"
-		res.Detail = fmt.Sprintf("would %s %s into %s", strategyVerb(opt), upstreamRef, branch)
+		ignoreMsg := ""
+		if len(patterns) > 0 {
+			ignoreMsg = fmt.Sprintf(" (ignoring %d pattern(s))", len(patterns))
+		}
+		res.Detail = fmt.Sprintf("would %s %s into %s%s", strategyVerb(opt), upstreamRef, branch, ignoreMsg)
 		return res
 	}
 
@@ -112,8 +132,48 @@ func syncOne(repo string, opt syncOptions) syncResult {
 	var mergeErr error
 	if opt.Rebase {
 		_, mergeErr = git(repo, "rebase", upstreamRef)
-	} else {
+	} else if len(patterns) == 0 {
 		_, mergeErr = git(repo, "merge", "--no-edit", upstreamRef)
+	} else {
+		preMergeHead, err := gitRaw(repo, "rev-parse", "HEAD")
+		if err != nil {
+			res.Status, res.Detail = "error", "rev-parse HEAD failed: "+err.Error()
+			return res
+		}
+
+		_, mergeErr = gitRaw(repo, "merge", "--no-commit", "--no-ff", upstreamRef)
+		if mergeErr != nil {
+			conflicts := unmergedFiles(repo)
+			allConflictsIgnored := len(conflicts) > 0
+			for _, c := range conflicts {
+				if !pathMatchesIgnore(c, patterns) {
+					allConflictsIgnored = false
+					break
+				}
+			}
+			if allConflictsIgnored {
+				for _, c := range conflicts {
+					if _, err := gitRaw(repo, "cat-file", "-e", preMergeHead+":"+c); err == nil {
+						_, _ = gitRaw(repo, "checkout", preMergeHead, "--", c)
+						_, _ = gitRaw(repo, "add", "--", c)
+					} else {
+						_, _ = gitRaw(repo, "rm", "-f", "--cached", "--ignore-unmatch", "--", c)
+						_ = os.Remove(filepath.Join(repo, filepath.FromSlash(c)))
+					}
+				}
+				mergeErr = nil
+			}
+		}
+
+		if mergeErr == nil {
+			if err := restoreIgnoredInRepo(repo, preMergeHead, patterns); err != nil {
+				_, _ = gitRaw(repo, "merge", "--abort")
+				res.Status, res.Detail = "error", "restoring ignored paths failed: "+err.Error()
+				return res
+			}
+			msg := fmt.Sprintf("forkman: merge %s into %s", upstreamRef, branch)
+			_, mergeErr = gitRaw(repo, "commit", "--allow-empty", "-m", msg)
+		}
 	}
 
 	if mergeErr == nil {
@@ -153,9 +213,28 @@ func runSync(repos []string, opt syncOptions) bool {
 	results := make([]syncResult, 0, len(repos))
 	for _, repo := range repos {
 		fmt.Printf("==> %s\n", repo)
-		r := syncOne(repo, opt)
-		fmt.Printf("    %s: %s\n", r.Status, r.Detail)
-		results = append(results, r)
+
+		subs, _ := loadSubForks(repo)
+		whole := hasRepoFork(repo)
+		if !whole && len(subs) == 0 {
+			r := syncResult{Repo: repo, Status: "error",
+				Detail: "not initialized: run `forkman init` (or `forkman init --dir SUBDIR`) here first"}
+			fmt.Printf("    %s: %s\n", r.Status, r.Detail)
+			results = append(results, r)
+			continue
+		}
+
+		if whole {
+			r := syncOne(repo, opt)
+			fmt.Printf("    %s: %s\n", r.Status, r.Detail)
+			results = append(results, r)
+		}
+		for _, sf := range subs {
+			fmt.Printf("  -> %s/\n", sf.Prefix)
+			r := syncSub(repo, sf, opt)
+			fmt.Printf("    %s: %s\n", r.Status, r.Detail)
+			results = append(results, r)
+		}
 	}
 
 	fmt.Println("\nSummary:")
