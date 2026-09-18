@@ -20,12 +20,13 @@ go install .
 ## Usage
 
 ```
-forkman init   [--upstream URL] [--remote NAME] [--branch NAME] [--ignore PATTERNS]
-forkman sync   [--all] [--rebase] [--dry-run] [PATH...]
+forkman init   [--upstream URL] [--remote NAME] [--branch NAME] [--tag TAG] [--ignore PATTERNS]
+               [--dir SUBDIR [--base REF]]
+forkman sync   [--all] [--rebase] [--tag TAG] [--dry-run] [PATH...]
 forkman list
 forkman status [PATH]
 forkman ignore [--dir SUBDIR] [add|remove] [PATTERN]
-forkman remove [PATH]
+forkman remove [PATH] [--dir SUBDIR]
 ```
 
 ### 1. Register a fork
@@ -36,6 +37,12 @@ Run inside a cloned fork:
 forkman init --upstream https://github.com/original/project.git --ignore "docs,config/*.yaml"
 ```
 
+To track a specific tag instead of a branch:
+
+```sh
+forkman init --upstream https://github.com/original/project.git --tag v1.2.0
+```
+
 This adds an `upstream` remote, records `fork.*` keys in the repo's git config,
 and adds the repo to a global registry (`~/.config/forkman/registry.json`, or
 `$XDG_CONFIG_HOME`). Re-running `init` is safe — it just updates the config.
@@ -44,6 +51,9 @@ Flags:
 - `--upstream URL` — the original repository. Omit to adopt an existing remote.
 - `--remote NAME` — remote name (default `upstream`).
 - `--branch NAME` — upstream branch to track (default: the remote's HEAD).
+- `--tag TAG` — upstream tag to track instead of a branch.
+- `--dir SUBDIR` — register a vendored subdirectory instead of the whole repo.
+- `--base REF` — with `--dir`: upstream commit the copy matches (default: current tip).
 - `--ignore PATTERNS` — comma-separated folder or file patterns to ignore from upstream sync.
 
 You can also use a `.forkignore` file in the repo root (or vendored subdirectory) to define ignored paths, or use `forkman ignore add <pattern>`.
@@ -71,19 +81,20 @@ During `forkman sync`:
 ### 3. Sync
 
 ```sh
-forkman sync          # sync the current repo
-forkman sync --all    # sync every registered fork, from anywhere
-forkman sync ../other # sync a specific path
-forkman sync --rebase # rebase onto upstream instead of merging
+forkman sync            # sync the current repo to tracked branch or tag
+forkman sync --tag v2.0 # sync to a specific upstream tag
+forkman sync --all      # sync every registered fork, from anywhere
+forkman sync ../other   # sync a specific path
+forkman sync --rebase   # rebase onto upstream instead of merging
 forkman sync --dry-run
 ```
 
 Pipeline per repo:
 
 1. Stash uncommitted changes (auto-restored afterward).
-2. `git fetch upstream <branch>`.
+2. Fetch upstream (`git fetch upstream <branch>` or `git fetch --force upstream tag <tag>`).
 3. If already up to date, report and skip.
-4. `git merge --no-edit upstream/<branch>` (or `git rebase` with `--rebase`).
+4. `git merge --no-edit <upstreamRef>` (or `git rebase` with `--rebase`).
 5. **On conflict**: abort the merge (your branch stays clean) and create
    `fork-sync/<branch>-<date>` at the upstream tip. Resolve later with:
    ```sh
@@ -92,7 +103,7 @@ Pipeline per repo:
 
 Exit code is non-zero if any repo conflicted or errored — handy for cron.
 
-### 3. Vendored subdirectories
+### 4. Vendored subdirectories
 
 If you cloned an upstream repo *into* another repo, there is one push that
 matters — the parent's. `forkman init --dir` registers the subdirectory so
@@ -103,6 +114,14 @@ cd parent-repo
 forkman init --dir vendor/proj --upstream https://github.com/original/proj.git
 forkman sync
 git push            # the parent's remote, the only one you push to
+```
+
+You can also vendor a specific tag:
+
+```sh
+forkman init --dir vendor/proj --upstream https://github.com/original/proj.git --tag v1.0.0
+# or sync to a new release tag dynamically:
+forkman sync --tag v1.1.0
 ```
 
 Two modes, picked automatically from whether the subdirectory still has a `.git`.
@@ -120,7 +139,7 @@ base**, so your local edits and upstream's are combined properly.
 
 ```
 forkman sync
-  shadow repo: commit local drift, then `git merge upstream/main`
+  shadow repo: commit local drift, then `git merge upstream/main` (or tag)
   parent repo: commit the resulting file changes
   you:         git push
 ```
@@ -157,10 +176,10 @@ mode instead uses the nested clone's own `origin`), so one parent can host
 several vendored copies. A repo may also be a fork itself and host vendored
 copies; `sync` handles both.
 
-### 4. Inspect
+### 5. Inspect
 
 ```sh
-forkman list             # table of all forks: path, upstream, branch, clean/dirty
+forkman list             # table of all forks: path, upstream, branch/tag, clean/dirty
 forkman status [PATH]    # divergence (ahead/behind), worktree state, parked branches
 forkman remove [PATH]    # unregister a fork (does not touch the repo)
 ```
@@ -171,7 +190,8 @@ forkman remove [PATH]    # unregister a fork (does not touch the repo)
   - `fork.upstream` — upstream URL
   - `fork.upstreamRemote` — remote name (default `upstream`)
   - `fork.upstreamBranch` — tracked branch
-  - `fork.sub.<prefix>.{mode,upstream,remote,branch}` — one vendored
+  - `fork.upstreamTag` — tracked tag
+  - `fork.sub.<prefix>.{mode,upstream,remote,branch,tag}` — one vendored
     subdirectory each; plus `base` (replay: the upstream commit the copy is
     level with) or `gitdir` (shadow: where the parked history lives)
 - **Global** — `~/.config/forkman/registry.json`, a list of fork paths for

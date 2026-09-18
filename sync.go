@@ -15,6 +15,7 @@ type forkConfig struct {
 	Remote string // e.g. "upstream"
 	URL    string // upstream fetch URL
 	Branch string // upstream branch to track, e.g. "main"
+	Tag    string // upstream tag to track, e.g. "v1.0.0"
 }
 
 // loadForkConfig reads fork.* keys from the repo's git config.
@@ -24,6 +25,7 @@ func loadForkConfig(repo string) (forkConfig, error) {
 	c.Remote, _ = gitConfigGet(repo, "fork.upstreamRemote")
 	c.URL, _ = gitConfigGet(repo, "fork.upstream")
 	c.Branch, _ = gitConfigGet(repo, "fork.upstreamBranch")
+	c.Tag, _ = gitConfigGet(repo, "fork.upstreamTag")
 
 	if c.Remote == "" {
 		c.Remote = "upstream"
@@ -31,7 +33,7 @@ func loadForkConfig(repo string) (forkConfig, error) {
 	if c.URL == "" && !remoteExists(repo, c.Remote) {
 		return c, fmt.Errorf("not initialized: run `forkman init` here first")
 	}
-	if c.Branch == "" {
+	if c.Tag == "" && c.Branch == "" {
 		if b, err := defaultBranch(repo, c.Remote); err == nil {
 			c.Branch = b
 		} else if b, err := currentBranch(repo); err == nil {
@@ -41,6 +43,14 @@ func loadForkConfig(repo string) (forkConfig, error) {
 		}
 	}
 	return c, nil
+}
+
+// cleanTag normalizes a tag string by stripping refs/tags/ and tags/ prefixes and trimming spaces.
+func cleanTag(tag string) string {
+	tag = strings.TrimSpace(tag)
+	tag = strings.TrimPrefix(tag, "refs/tags/")
+	tag = strings.TrimPrefix(tag, "tags/")
+	return tag
 }
 
 // hasRepoFork reports whether the repo itself (not just subdirectories of it)
@@ -63,6 +73,7 @@ type syncResult struct {
 // syncOptions controls the sync pipeline.
 type syncOptions struct {
 	Rebase bool
+	Tag    string // if set, sync to this specific tag instead of the tracked branch/tag
 }
 
 // syncOne runs the full sync pipeline for a single repo.
@@ -101,12 +112,27 @@ func syncOne(repo string, opt syncOptions) (res syncResult) {
 		}
 	}()
 
-	// 2. Fetch upstream.
-	if _, err := git(repo, "fetch", cfg.Remote, cfg.Branch); err != nil {
-		res.Status, res.Detail = "error", "fetch failed: "+err.Error()
-		return res
+	var upstreamRef string
+	targetTag := opt.Tag
+	if targetTag == "" {
+		targetTag = cfg.Tag
 	}
-	upstreamRef := cfg.Remote + "/" + cfg.Branch
+
+	if targetTag != "" {
+		// 2. Fetch upstream tag.
+		if _, err := git(repo, "fetch", "--force", cfg.Remote, "tag", targetTag); err != nil {
+			res.Status, res.Detail = "error", "fetch failed: "+err.Error()
+			return res
+		}
+		upstreamRef = "tags/" + targetTag
+	} else {
+		// 2. Fetch upstream branch.
+		if _, err := git(repo, "fetch", cfg.Remote, cfg.Branch); err != nil {
+			res.Status, res.Detail = "error", "fetch failed: "+err.Error()
+			return res
+		}
+		upstreamRef = cfg.Remote + "/" + cfg.Branch
+	}
 
 	patterns := loadIgnorePatterns(repo, repo, "fork.ignore")
 

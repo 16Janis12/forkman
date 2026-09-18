@@ -59,7 +59,7 @@ func gitShadowRaw(repo string, sf subFork, args ...string) (string, error) {
 }
 
 // initShadow converts a nested clone at prefix into a shadow-mode sub-fork.
-func initShadow(repo, prefix, upstream, remote, branch, ignore string) error {
+func initShadow(repo, prefix, upstream, remote, branch, tag, ignore string) error {
 	full := filepath.Join(repo, prefix)
 	nested := filepath.Join(full, ".git")
 
@@ -75,6 +75,10 @@ func initShadow(repo, prefix, upstream, remote, branch, ignore string) error {
 	if mustExist(gitDirAbs) {
 		return fmt.Errorf("%s already exists — %s seems to be registered already; "+
 			"`forkman remove --dir %s` first", gitDirAbs, prefix, prefix)
+	}
+
+	if branch != "" && tag != "" {
+		return fmt.Errorf("cannot specify both --branch and --tag")
 	}
 
 	if remote == "" || remote == "upstream" {
@@ -122,14 +126,22 @@ func initShadow(repo, prefix, upstream, remote, branch, ignore string) error {
 		}
 	}
 
-	if branch == "" {
-		if b, err := gitShadowRaw(repo, sf, "symbolic-ref", "--quiet", "--short", "HEAD"); err == nil && b != "" {
-			branch = b
-		} else {
-			return fmt.Errorf("%s is not on a branch; pass --branch NAME", prefix)
+	if tag != "" {
+		if _, err := gitShadowRaw(repo, sf, "fetch", "--force", remote, "tag", tag); err != nil {
+			return fmt.Errorf("fetch tag %s from %s: %w", tag, remote, err)
 		}
+		sf.Tag = tag
+	} else {
+		if branch == "" {
+			if b, err := gitShadowRaw(repo, sf, "symbolic-ref", "--quiet", "--short", "HEAD"); err == nil && b != "" {
+				branch = b
+			} else {
+				return fmt.Errorf("%s is not on a branch; pass --branch NAME", prefix)
+			}
+		}
+		sf.Branch = branch
 	}
-	sf.Branch, sf.URL = branch, upstream
+	sf.URL = upstream
 
 	for key, val := range map[string]string{
 		"prefix":   prefix,
@@ -138,6 +150,7 @@ func initShadow(repo, prefix, upstream, remote, branch, ignore string) error {
 		"remote":   remote,
 		"upstream": upstream,
 		"branch":   branch,
+		"tag":      tag,
 		"ignore":   ignore,
 	} {
 		if val == "" {
@@ -158,7 +171,11 @@ func initShadow(repo, prefix, upstream, remote, branch, ignore string) error {
 
 	fmt.Printf("registered %s (shadow mode, subdirectory of %s)\n", prefix, repo)
 	fmt.Printf("  history:  %s (moved out of the worktree)\n", gitDirRel)
-	fmt.Printf("  upstream: %s/%s (%s)\n", remote, branch, upstream)
+	if tag != "" {
+		fmt.Printf("  upstream: %s (tag %s, %s)\n", remote, tag, upstream)
+	} else {
+		fmt.Printf("  upstream: %s/%s (%s)\n", remote, branch, upstream)
+	}
 	if staged {
 		fmt.Printf("  %s is now tracked by the parent as plain files — commit and `git push` as usual.\n", prefix)
 	}
@@ -250,14 +267,29 @@ func syncShadow(repo string, sf subFork, opt syncOptions) syncResult {
 		res.Status, res.Detail = "error", "shadow repo HEAD is detached (not on a branch)"
 		return res
 	}
-	if sf.Branch == "" {
-		sf.Branch = branch
-	}
-	upstreamRef := sf.Remote + "/" + sf.Branch
 
-	if _, err := gitShadow(repo, sf, "fetch", sf.Remote, sf.Branch); err != nil {
-		res.Status, res.Detail = "error", "fetch failed: "+err.Error()
-		return res
+	var upstreamRef string
+	targetTag := opt.Tag
+	if targetTag == "" {
+		targetTag = sf.Tag
+	}
+
+	if targetTag != "" {
+		if _, err := gitShadow(repo, sf, "fetch", "--force", sf.Remote, "tag", targetTag); err != nil {
+			res.Status, res.Detail = "error", "fetch failed: "+err.Error()
+			return res
+		}
+		upstreamRef = "tags/" + targetTag
+	} else {
+		if sf.Branch == "" {
+			sf.Branch = branch
+		}
+		upstreamRef = sf.Remote + "/" + sf.Branch
+
+		if _, err := gitShadow(repo, sf, "fetch", sf.Remote, sf.Branch); err != nil {
+			res.Status, res.Detail = "error", "fetch failed: "+err.Error()
+			return res
+		}
 	}
 
 	patterns := loadIgnorePatterns(repo, filepath.Join(repo, sf.Prefix), subKey(sf.Prefix, "ignore"))

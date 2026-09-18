@@ -37,12 +37,18 @@ type subFork struct {
 	Remote string // remote name (in the parent repo for replay, in the shadow repo for shadow)
 	URL    string // upstream fetch URL
 	Branch string // upstream branch to track
+	Tag    string // upstream tag to track
 	Base   string // replay mode: upstream commit the current copy corresponds to
 	GitDir string // shadow mode: repo-relative path of the parked git dir
 	Ignore string // comma-separated ignore patterns
 }
 
-func (s subFork) ref() string { return s.Remote + "/" + s.Branch }
+func (s subFork) ref() string {
+	if s.Tag != "" {
+		return "tags/" + s.Tag
+	}
+	return s.Remote + "/" + s.Branch
+}
 
 // configKey builds the git config key for one field of this sub-fork.
 func subKey(prefix, field string) string {
@@ -106,6 +112,8 @@ func loadSubForks(repo string) ([]subFork, error) {
 			sf.URL = val
 		case "branch":
 			sf.Branch = val
+		case "tag":
+			sf.Tag = val
 		case "base":
 			sf.Base = val
 		case "mode":
@@ -149,7 +157,7 @@ func loadSubFork(repo, prefix string) (subFork, error) {
 }
 
 // initSub registers a vendored subdirectory fork inside repo.
-func initSub(repo, dir, upstream, remote, branch, base, ignore string) error {
+func initSub(repo, dir, upstream, remote, branch, tag, base, ignore string) error {
 	prefix, err := relPrefix(repo, dir)
 	if err != nil {
 		return err
@@ -157,6 +165,10 @@ func initSub(repo, dir, upstream, remote, branch, base, ignore string) error {
 	full := filepath.Join(repo, prefix)
 	if !mustExist(full) {
 		return fmt.Errorf("directory %s does not exist", full)
+	}
+
+	if branch != "" && tag != "" {
+		return fmt.Errorf("cannot specify both --branch and --tag")
 	}
 
 	// A subdirectory that still has its own history gets shadow mode: the git
@@ -167,7 +179,7 @@ func initSub(repo, dir, upstream, remote, branch, base, ignore string) error {
 			return fmt.Errorf("--base applies only to subdirectories without a .git "+
 				"(%s has its own history, so its merge base is tracked by git)", prefix)
 		}
-		return initShadow(repo, prefix, upstream, remote, branch, ignore)
+		return initShadow(repo, prefix, upstream, remote, branch, tag, ignore)
 	}
 
 	if remote == "" || remote == "upstream" {
@@ -199,24 +211,33 @@ func initSub(repo, dir, upstream, remote, branch, base, ignore string) error {
 		return nil
 	}
 
-	// Fetch so we can resolve the branch and pin a base commit.
-	if branch == "" {
-		if _, err := gitRaw(repo, "fetch", remote); err != nil {
-			return fmt.Errorf("fetch %s: %w", remote, err)
+	// Fetch so we can resolve the branch/tag and pin a base commit.
+	if tag != "" {
+		if _, err := gitRaw(repo, "fetch", "--force", remote, "tag", tag); err != nil {
+			return fmt.Errorf("fetch tag %s from %s: %w", tag, remote, err)
 		}
-		b, err := defaultBranch(repo, remote)
-		if err != nil {
-			return err
+		if base == "" {
+			base = "tags/" + tag
 		}
-		branch = b
-	}
-	if _, err := gitRaw(repo, "fetch", remote, branch); err != nil {
-		return fmt.Errorf("fetch %s %s: %w", remote, branch, err)
+	} else {
+		if branch == "" {
+			if _, err := gitRaw(repo, "fetch", remote); err != nil {
+				return fmt.Errorf("fetch %s: %w", remote, err)
+			}
+			b, err := defaultBranch(repo, remote)
+			if err != nil {
+				return err
+			}
+			branch = b
+		}
+		if _, err := gitRaw(repo, "fetch", remote, branch); err != nil {
+			return fmt.Errorf("fetch %s %s: %w", remote, branch, err)
+		}
+		if base == "" {
+			base = remote + "/" + branch // default: the copy matches upstream tip today
+		}
 	}
 
-	if base == "" {
-		base = remote + "/" + branch // default: the copy matches upstream tip today
-	}
 	baseSHA, err := gitRaw(repo, "rev-parse", "--verify", base+"^{commit}")
 	if err != nil {
 		return fmt.Errorf("cannot resolve --base %q: %w", base, err)
@@ -228,6 +249,7 @@ func initSub(repo, dir, upstream, remote, branch, base, ignore string) error {
 		"remote":   remote,
 		"upstream": upstream,
 		"branch":   branch,
+		"tag":      tag,
 		"base":     baseSHA,
 		"ignore":   ignore,
 	} {
@@ -243,7 +265,11 @@ func initSub(repo, dir, upstream, remote, branch, base, ignore string) error {
 	}
 
 	fmt.Printf("registered %s (subdirectory of %s)\n", prefix, repo)
-	fmt.Printf("  upstream: %s/%s (%s)\n", remote, branch, upstream)
+	if tag != "" {
+		fmt.Printf("  upstream: %s (tag %s, %s)\n", remote, tag, upstream)
+	} else {
+		fmt.Printf("  upstream: %s/%s (%s)\n", remote, branch, upstream)
+	}
 	fmt.Printf("  base:     %s\n", short(baseSHA))
 	fmt.Printf("run `forkman sync` to replay upstream changes onto %s.\n", prefix)
 	return nil
@@ -289,18 +315,33 @@ func syncSub(repo string, sf subFork, opt syncOptions) syncResult {
 func syncReplay(repo string, sf subFork, opt syncOptions) (res syncResult) {
 	res = syncResult{Repo: repo + " [" + sf.Prefix + "]"}
 
-	if sf.Branch == "" {
-		b, err := defaultBranch(repo, sf.Remote)
-		if err != nil {
-			res.Status, res.Detail = "error", err.Error()
-			return res
-		}
-		sf.Branch = b
+	var upstreamRef string
+	targetTag := opt.Tag
+	if targetTag == "" {
+		targetTag = sf.Tag
 	}
 
-	if _, err := git(repo, "fetch", sf.Remote, sf.Branch); err != nil {
-		res.Status, res.Detail = "error", "fetch failed: "+err.Error()
-		return res
+	if targetTag != "" {
+		if _, err := git(repo, "fetch", "--force", sf.Remote, "tag", targetTag); err != nil {
+			res.Status, res.Detail = "error", "fetch failed: "+err.Error()
+			return res
+		}
+		upstreamRef = "tags/" + targetTag
+	} else {
+		if sf.Branch == "" {
+			b, err := defaultBranch(repo, sf.Remote)
+			if err != nil {
+				res.Status, res.Detail = "error", err.Error()
+				return res
+			}
+			sf.Branch = b
+		}
+		upstreamRef = sf.Remote + "/" + sf.Branch
+
+		if _, err := git(repo, "fetch", sf.Remote, sf.Branch); err != nil {
+			res.Status, res.Detail = "error", "fetch failed: "+err.Error()
+			return res
+		}
 	}
 
 	patterns := loadIgnorePatterns(repo, filepath.Join(repo, sf.Prefix), subKey(sf.Prefix, "ignore"))
@@ -311,7 +352,7 @@ func syncReplay(repo string, sf subFork, opt syncOptions) (res syncResult) {
 		if len(patterns) > 0 {
 			ignoreMsg = fmt.Sprintf(" (ignoring %d pattern(s))", len(patterns))
 		}
-		res.Detail = fmt.Sprintf("would replay %s onto %s/%s", sf.ref(), sf.Prefix, ignoreMsg)
+		res.Detail = fmt.Sprintf("would replay %s onto %s/%s", upstreamRef, sf.Prefix, ignoreMsg)
 		return res
 	}
 
@@ -321,7 +362,7 @@ func syncReplay(repo string, sf subFork, opt syncOptions) (res syncResult) {
 		return res
 	}
 
-	newTip, err := gitRaw(repo, "rev-parse", "--verify", sf.ref()+"^{commit}")
+	newTip, err := gitRaw(repo, "rev-parse", "--verify", upstreamRef+"^{commit}")
 	if err != nil {
 		res.Status, res.Detail = "error", err.Error()
 		return res
@@ -393,7 +434,7 @@ func syncReplay(repo string, sf subFork, opt syncOptions) (res syncResult) {
 		}
 	}
 
-	msg := fmt.Sprintf("forkman: sync %s from %s (%s..%s)", sf.Prefix, sf.ref(), short(sf.Base), short(newTip))
+	msg := fmt.Sprintf("forkman: sync %s from %s (%s..%s)", sf.Prefix, upstreamRef, short(sf.Base), short(newTip))
 	if _, err := gitRaw(repo, "commit", "-m", msg); err != nil {
 		res.Status, res.Detail = "error", "commit failed: "+err.Error()
 		return res
