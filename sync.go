@@ -8,14 +8,16 @@ import (
 	"time"
 )
 
+// syncBranchPrefix is the prefix used for conflict branches parked on merge failure.
 const syncBranchPrefix = "fork-sync/"
 
-// forkConfig is the per-repo upstream configuration stored in git config.
+// forkConfig holds settings read from the current repo's git config.
 type forkConfig struct {
-	Remote string // e.g. "upstream"
-	URL    string // upstream fetch URL
-	Branch string // upstream branch to track, e.g. "main"
-	Tag    string // upstream tag to track, e.g. "v1.0.0"
+	Remote string
+	URL    string
+	Branch string
+	Tag    string
+	Mode   string // "latest-rev" or "semantic-tags"
 }
 
 // loadForkConfig reads fork.* keys from the repo's git config.
@@ -26,6 +28,7 @@ func loadForkConfig(repo string) (forkConfig, error) {
 	c.URL, _ = gitConfigGet(repo, "fork.upstream")
 	c.Branch, _ = gitConfigGet(repo, "fork.upstreamBranch")
 	c.Tag, _ = gitConfigGet(repo, "fork.upstreamTag")
+	c.Mode, _ = gitConfigGet(repo, "fork.syncMode")
 
 	if c.Remote == "" {
 		c.Remote = "upstream"
@@ -65,15 +68,20 @@ func hasRepoFork(repo string) bool {
 
 // syncResult captures the outcome of syncing one repo for the summary table.
 type syncResult struct {
-	Repo   string
-	Status string // "up-to-date", "merged N", "CONFLICT", "error"
-	Detail string
+	Repo        string
+	Status      string // "up-to-date", "merged N", "CONFLICT", "error"
+	Detail      string
+	Tag         string // resolved tag if applicable
+	PrevTag     string // tag before sync if applicable
+	UpgradeType string // "MAJOR", "MINOR", "PATCH", or ""
 }
 
 // syncOptions controls the sync pipeline.
 type syncOptions struct {
-	Rebase bool
-	Tag    string // if set, sync to this specific tag instead of the tracked branch/tag
+	Rebase     bool
+	Tag        string // if set, sync to this specific tag instead of the tracked branch/tag
+	Mode       string // "latest-rev" or "semantic-tags"
+	TagPattern string // regex pattern for semantic tags
 }
 
 // syncOne runs the full sync pipeline for a single repo.
@@ -93,6 +101,14 @@ func syncOne(repo string, opt syncOptions) (res syncResult) {
 		res.Status, res.Detail = "error", err.Error()
 		return res
 	}
+
+	prevTag := cfg.Tag
+	if prevTag == "" {
+		if out, err := gitRaw(repo, "describe", "--tags", "--abbrev=0", "HEAD"); err == nil {
+			prevTag = cleanTag(strings.TrimSpace(out))
+		}
+	}
+	res.PrevTag = prevTag
 
 	// 1. Stash dirty tree so we never clobber uncommitted work.
 	stashed := false
@@ -114,11 +130,38 @@ func syncOne(repo string, opt syncOptions) (res syncResult) {
 
 	var upstreamRef string
 	targetTag := opt.Tag
-	if targetTag == "" {
+
+	effectiveMode := opt.Mode
+	if effectiveMode == "" && targetTag == "" {
+		effectiveMode = cfg.Mode
+	}
+
+	if effectiveMode == modeSemanticTags {
+		latestTag, err := findLatestSemanticTag(repo, cfg.Remote, opt.TagPattern)
+		if err != nil {
+			res.Status, res.Detail = "error", err.Error()
+			return res
+		}
+		targetTag = latestTag
+		res.Tag = latestTag
+	} else if effectiveMode == modeLatestRev {
+		targetTag = ""
+		if cfg.Branch == "" {
+			if b, err := defaultBranch(repo, cfg.Remote); err == nil {
+				cfg.Branch = b
+			} else if b, err := currentBranch(repo); err == nil {
+				cfg.Branch = b
+			}
+		}
+	} else if targetTag == "" {
 		targetTag = cfg.Tag
 	}
 
 	if targetTag != "" {
+		res.Tag = targetTag
+		if prevTag != targetTag {
+			res.UpgradeType = semverUpgradeType(prevTag, targetTag)
+		}
 		// 2. Fetch upstream tag.
 		if _, err := git(repo, "fetch", "--force", cfg.Remote, "tag", targetTag); err != nil {
 			res.Status, res.Detail = "error", "fetch failed: "+err.Error()
@@ -142,14 +185,22 @@ func syncOne(repo string, opt syncOptions) (res syncResult) {
 		if len(patterns) > 0 {
 			ignoreMsg = fmt.Sprintf(" (ignoring %d pattern(s))", len(patterns))
 		}
-		res.Detail = fmt.Sprintf("would %s %s into %s%s", strategyVerb(opt), upstreamRef, branch, ignoreMsg)
+		upgradeMsg := ""
+		if res.UpgradeType != "" {
+			upgradeMsg = fmt.Sprintf(" [%s upgrade]", res.UpgradeType)
+		}
+		res.Detail = fmt.Sprintf("would %s %s into %s%s%s", strategyVerb(opt), upstreamRef, branch, ignoreMsg, upgradeMsg)
 		return res
 	}
 
 	// 3. Already up to date?
 	ahead, behind, err := aheadBehind(repo, upstreamRef, "HEAD")
 	if err == nil && behind == 0 {
+		if !dryRun && effectiveMode == modeSemanticTags && targetTag != "" {
+			_ = gitConfigSet(repo, "fork.upstreamTag", targetTag)
+		}
 		res.Status = "up-to-date"
+		res.UpgradeType = ""
 		res.Detail = fmt.Sprintf("ahead %d of %s", ahead, upstreamRef)
 		return res
 	}
@@ -203,8 +254,19 @@ func syncOne(repo string, opt syncOptions) (res syncResult) {
 	}
 
 	if mergeErr == nil {
+		if !dryRun && effectiveMode == modeSemanticTags && targetTag != "" {
+			_ = gitConfigSet(repo, "fork.upstreamTag", targetTag)
+		}
 		res.Status = fmt.Sprintf("merged %d", behind)
-		res.Detail = fmt.Sprintf("from %s", upstreamRef)
+		if res.UpgradeType != "" {
+			if prevTag != "" && prevTag != targetTag {
+				res.Detail = fmt.Sprintf("from %s (%s upgrade: %s -> %s)", upstreamRef, res.UpgradeType, prevTag, targetTag)
+			} else {
+				res.Detail = fmt.Sprintf("from %s (%s upgrade)", upstreamRef, res.UpgradeType)
+			}
+		} else {
+			res.Detail = fmt.Sprintf("from %s", upstreamRef)
+		}
 		return res
 	}
 
@@ -215,20 +277,29 @@ func syncOne(repo string, opt syncOptions) (res syncResult) {
 		_, _ = git(repo, "merge", "--abort")
 	}
 
-	parked := syncBranchPrefix + branch + "-" + time.Now().Format("20060102")
-	if _, err := git(repo, "branch", "-f", parked, upstreamRef); err != nil {
+	parkBranch := fmt.Sprintf("%s%s-%s", syncBranchPrefix, branch, time.Now().Format("20060102"))
+	targetCommit := upstreamRef
+	if opt.Rebase {
+		targetCommit = upstreamRef
+	}
+	if _, err := git(repo, "branch", "-f", parkBranch, targetCommit); err != nil {
 		res.Status = "CONFLICT"
-		res.Detail = "conflict, and failed to create park branch: " + err.Error()
+		res.Detail = fmt.Sprintf("merge conflict (failed to create branch %s: %v)", parkBranch, err)
 		return res
 	}
+
 	res.Status = "CONFLICT"
-	res.Detail = fmt.Sprintf("parked upstream in %q — resolve with: git merge %s", parked, parked)
+	upgradeInfo := ""
+	if res.UpgradeType != "" {
+		upgradeInfo = fmt.Sprintf(" (%s upgrade)", res.UpgradeType)
+	}
+	res.Detail = fmt.Sprintf("parked upstream in %q%s — resolve with: git merge %s", parkBranch, upgradeInfo, parkBranch)
 	return res
 }
 
 func strategyVerb(opt syncOptions) string {
 	if opt.Rebase {
-		return "rebase onto"
+		return "rebase"
 	}
 	return "merge"
 }
@@ -268,11 +339,107 @@ func runSync(repos []string, opt syncOptions) bool {
 	for _, r := range results {
 		mark := "ok"
 		switch {
-		case strings.HasPrefix(r.Status, "CONFLICT"), r.Status == "error":
+		case strings.HasPrefix(r.Status, "CONFLICT"):
 			mark = "!!"
 			hadFailure = true
+			if os.Getenv("GITHUB_ACTIONS") == "true" {
+				fmt.Printf("::warning::%s: %s (%s)\n", r.Repo, r.Status, r.Detail)
+			}
+		case r.Status == "error":
+			mark = "!!"
+			hadFailure = true
+			if os.Getenv("GITHUB_ACTIONS") == "true" {
+				fmt.Printf("::error::%s: %s (%s)\n", r.Repo, r.Status, r.Detail)
+			}
+		default:
+			if r.UpgradeType != "" && os.Getenv("GITHUB_ACTIONS") == "true" {
+				fmt.Printf("::notice::%s: Upstream upgraded (%s version bump: %s)\n", r.Repo, r.UpgradeType, r.Tag)
+			}
 		}
-		fmt.Printf("  [%s] %-10s %s\n", mark, r.Status, r.Repo)
+		upgradeSuffix := ""
+		if r.UpgradeType != "" {
+			upgradeSuffix = fmt.Sprintf(" (%s upgrade)", r.UpgradeType)
+		}
+		fmt.Printf("  [%s] %-10s %s%s\n", mark, r.Status, r.Repo, upgradeSuffix)
 	}
+
+	writeGitHubOutput(results)
+	writeGitHubSummary(results, opt)
+
 	return hadFailure
+}
+
+func writeGitHubOutput(results []syncResult) {
+	outputFile := os.Getenv("GITHUB_OUTPUT")
+	if outputFile == "" {
+		return
+	}
+	f, err := os.OpenFile(outputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	if len(results) > 0 {
+		r := results[0]
+		fmt.Fprintf(f, "status=%s\n", r.Status)
+		if r.Tag != "" {
+			fmt.Fprintf(f, "tag=%s\n", r.Tag)
+		}
+		fmt.Fprintf(f, "upgrade_type=%s\n", r.UpgradeType)
+		fmt.Fprintf(f, "upgrade-type=%s\n", r.UpgradeType)
+		synced := strings.HasPrefix(r.Status, "merged")
+		fmt.Fprintf(f, "synced=%t\n", synced)
+		if strings.HasPrefix(r.Status, "CONFLICT") {
+			if idx := strings.Index(r.Detail, syncBranchPrefix); idx != -1 {
+				parked := r.Detail[idx:]
+				if endIdx := strings.IndexAny(parked, " \t\n\""); endIdx != -1 {
+					parked = parked[:endIdx]
+				}
+				fmt.Fprintf(f, "parked_branch=%s\n", parked)
+				fmt.Fprintf(f, "parked-branch=%s\n", parked)
+			}
+		}
+	}
+}
+
+func writeGitHubSummary(results []syncResult, opt syncOptions) {
+	summaryFile := os.Getenv("GITHUB_STEP_SUMMARY")
+	if summaryFile == "" {
+		return
+	}
+	f, err := os.OpenFile(summaryFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	var sb strings.Builder
+	sb.WriteString("### Forkman Sync Summary\n\n")
+	if opt.Mode != "" {
+		sb.WriteString(fmt.Sprintf("- **Mode:** `%s`\n", opt.Mode))
+	}
+	if opt.Tag != "" {
+		sb.WriteString(fmt.Sprintf("- **Tag:** `%s`\n", opt.Tag))
+	}
+	if len(results) > 0 && results[0].UpgradeType != "" {
+		sb.WriteString(fmt.Sprintf("- **Upgrade Type:** **`%s`**\n", results[0].UpgradeType))
+	}
+	sb.WriteString("\n| Repository | Status | Upgrade | Detail |\n")
+	sb.WriteString("| :--- | :--- | :--- | :--- |\n")
+	for _, r := range results {
+		icon := "✅"
+		if strings.HasPrefix(r.Status, "CONFLICT") {
+			icon = "⚠️"
+		} else if r.Status == "error" {
+			icon = "❌"
+		}
+		upgradeBadge := "-"
+		if r.UpgradeType != "" {
+			upgradeBadge = fmt.Sprintf("**%s**", r.UpgradeType)
+		}
+		sb.WriteString(fmt.Sprintf("| `%s` | %s %s | %s | %s |\n", r.Repo, icon, r.Status, upgradeBadge, r.Detail))
+	}
+	sb.WriteString("\n")
+	_, _ = f.WriteString(sb.String())
 }

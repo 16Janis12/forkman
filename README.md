@@ -20,14 +20,35 @@ go install .
 ## Usage
 
 ```
-forkman init   [--upstream URL] [--remote NAME] [--branch NAME] [--tag TAG] [--ignore PATTERNS]
+forkman init   [--upstream URL] [--remote NAME] [--branch NAME] [--tag TAG] [--mode MODE] [--ignore PATTERNS]
                [--dir SUBDIR [--base REF]]
-forkman sync   [--all] [--rebase] [--tag TAG] [--dry-run] [PATH...]
+forkman sync   [--all] [--rebase] [--tag TAG] [--mode MODE] [--tag-pattern PATTERN] [--dry-run] [PATH...]
 forkman list
 forkman status [PATH]
 forkman ignore [--dir SUBDIR] [add|remove] [PATTERN]
 forkman remove [PATH] [--dir SUBDIR]
 ```
+
+## Sync Modes
+
+`forkman` supports two synchronization modes:
+
+1. **`latest` (or `latest-rev`)**: Syncs against the tip of the upstream tracked branch (e.g. `main` or upstream HEAD).
+2. **`semantic-tags` (or `tags`)**: Automatically discovers upstream tags matching `v?[0-9]+\.[0-9]+\.[0-9]+`, parses them according to Semantic Versioning (Major.Minor.Patch numerical order), and syncs against the highest release tag. You can customize the pattern with `--tag-pattern`.
+   - In semantic mode, `forkman` detects the upgrade level (**`MAJOR`**, **`MINOR`**, or **`PATCH`**) and outputs it to the CLI, summary tables, and GitHub Action step outputs.
+
+You can set the mode permanently during `init`, or choose/override it per `sync`:
+
+```sh
+# Set mode during init
+forkman init --upstream https://github.com/original/project.git --mode semantic-tags
+
+# Or sync with explicit mode
+forkman sync --mode latest
+forkman sync --mode semantic-tags
+```
+
+---
 
 ### 1. Register a fork
 
@@ -37,7 +58,13 @@ Run inside a cloned fork:
 forkman init --upstream https://github.com/original/project.git --ignore "docs,config/*.yaml"
 ```
 
-To track a specific tag instead of a branch:
+To track semantic tags automatically:
+
+```sh
+forkman init --upstream https://github.com/original/project.git --mode semantic-tags
+```
+
+To pin a specific tag:
 
 ```sh
 forkman init --upstream https://github.com/original/project.git --tag v1.2.0
@@ -52,6 +79,7 @@ Flags:
 - `--remote NAME` — remote name (default `upstream`).
 - `--branch NAME` — upstream branch to track (default: the remote's HEAD).
 - `--tag TAG` — upstream tag to track instead of a branch.
+- `--mode MODE` — sync mode: `latest` (latest-rev) or `tags` (semantic-tags).
 - `--dir SUBDIR` — register a vendored subdirectory instead of the whole repo.
 - `--base REF` — with `--dir`: upstream commit the copy matches (default: current tip).
 - `--ignore PATTERNS` — comma-separated folder or file patterns to ignore from upstream sync.
@@ -81,11 +109,13 @@ During `forkman sync`:
 ### 3. Sync
 
 ```sh
-forkman sync            # sync the current repo to tracked branch or tag
-forkman sync --tag v2.0 # sync to a specific upstream tag
-forkman sync --all      # sync every registered fork, from anywhere
-forkman sync ../other   # sync a specific path
-forkman sync --rebase   # rebase onto upstream instead of merging
+forkman sync                       # sync the current repo to tracked branch or tag
+forkman sync --mode semantic-tags  # find and sync to latest semantic tag (prints MAJOR/MINOR/PATCH)
+forkman sync --mode latest         # sync to the tip of upstream branch
+forkman sync --tag v2.0            # sync to a specific upstream tag
+forkman sync --all                 # sync every registered fork, from anywhere
+forkman sync ../other              # sync a specific path
+forkman sync --rebase              # rebase onto upstream instead of merging
 forkman sync --dry-run
 ```
 
@@ -101,7 +131,110 @@ Pipeline per repo:
    git merge fork-sync/main-20260709
    ```
 
-Exit code is non-zero if any repo conflicted or errored — handy for cron.
+Exit code is non-zero if any repo conflicted or errored — handy for cron and CI.
+
+---
+
+## GitHub Action
+
+`forkman` can run as a GitHub Action in your fork's workflows to keep your branch automatically synchronized with upstream.
+
+### Inputs
+
+| Input | Description | Default |
+| :--- | :--- | :--- |
+| `mode` | Sync mode: `'latest'` (tip of upstream branch) or `'semantic-tags'` (latest `v?[0-9]+\.[0-9]+\.[0-9]+` tag) | `'latest'` |
+| `upstream` | Upstream repository URL (e.g. `https://github.com/original/project.git`) | `''` |
+| `remote` | Name for the upstream remote | `'upstream'` |
+| `branch` | Upstream branch to track in `latest` mode | Upstream HEAD |
+| `tag-pattern` | Regex pattern for semantic tags | `v?[0-9]+\.[0-9]+\.[0-9]+` |
+| `dir` | Vendored subdirectory to sync | `''` |
+| `base` | Base commit for replay mode (used with `dir`) | `''` |
+| `ignore` | Comma-separated patterns to ignore | `''` |
+| `rebase` | Rebase onto upstream instead of merging | `'false'` |
+| `push` | Automatically push synced commits and conflict branches to `origin` | `'false'` |
+| `dry-run` | Print git commands without mutating anything | `'false'` |
+
+### Outputs
+
+| Output | Description |
+| :--- | :--- |
+| `status` | Sync status (`up-to-date`, `merged <N>`, `CONFLICT`, or `error`) |
+| `tag` | The tag that was synced to (when in `semantic-tags` mode) |
+| `upgrade-type` | Type of semantic version upgrade: `MAJOR`, `MINOR`, `PATCH`, or empty |
+| `synced` | Whether changes were merged (`true`/`false`) |
+| `parked-branch` | Parked conflict branch name if a conflict occurred (e.g. `fork-sync/main-20260918`) |
+
+### Example 1: Sync to Latest Revision Daily
+
+```yaml
+name: Sync with Upstream (Latest Revision)
+
+on:
+  schedule:
+    - cron: '0 4 * * *' # Run daily at 4am UTC
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: 16Janis12/forkman@main
+        with:
+          upstream: https://github.com/original/project.git
+          mode: latest
+          push: 'true'
+```
+
+### Example 2: Sync to Latest Semantic Tag Releases with Upgrade Classification
+
+```yaml
+name: Sync with Upstream Releases (Semantic Tags)
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # Check daily for new releases
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: 16Janis12/forkman@main
+        id: forkman
+        with:
+          upstream: https://github.com/original/project.git
+          mode: semantic-tags
+          push: 'true'
+
+      - name: On Release Sync
+        if: steps.forkman.outputs.synced == 'true'
+        run: |
+          echo "Synced upstream release: ${{ steps.forkman.outputs.tag }}"
+          echo "Upgrade type: ${{ steps.forkman.outputs.upgrade-type }}"
+
+      - name: Notify on Major Upgrade
+        if: steps.forkman.outputs.synced == 'true' && steps.forkman.outputs.upgrade-type == 'MAJOR'
+        run: |
+          echo "::notice title=Major Release Upgraded::Upstream received a MAJOR version upgrade to ${{ steps.forkman.outputs.tag }}"
+```
+
+When a merge conflict occurs, the action parks the upstream changes on `fork-sync/<branch>-<date>`, pushes that parked branch to `origin` (if `push: 'true'`), and sets annotations on the step summary so you can easily review and resolve the conflict.
+
+---
 
 ### 4. Vendored subdirectories
 
@@ -116,12 +249,12 @@ forkman sync
 git push            # the parent's remote, the only one you push to
 ```
 
-You can also vendor a specific tag:
+You can also vendor a specific tag or track semantic tags:
 
 ```sh
 forkman init --dir vendor/proj --upstream https://github.com/original/proj.git --tag v1.0.0
-# or sync to a new release tag dynamically:
-forkman sync --tag v1.1.0
+# or sync to the latest semantic release tag:
+forkman sync --mode semantic-tags
 ```
 
 Two modes, picked automatically from whether the subdirectory still has a `.git`.
@@ -191,7 +324,8 @@ forkman remove [PATH]    # unregister a fork (does not touch the repo)
   - `fork.upstreamRemote` — remote name (default `upstream`)
   - `fork.upstreamBranch` — tracked branch
   - `fork.upstreamTag` — tracked tag
-  - `fork.sub.<prefix>.{mode,upstream,remote,branch,tag}` — one vendored
+  - `fork.syncMode` — default sync mode (`latest-rev` or `semantic-tags`)
+  - `fork.sub.<prefix>.{mode,upstream,remote,branch,tag,syncMode}` — one vendored
     subdirectory each; plus `base` (replay: the upstream commit the copy is
     level with) or `gitdir` (shadow: where the parked history lives)
 - **Global** — `~/.config/forkman/registry.json`, a list of fork paths for

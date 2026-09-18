@@ -1,18 +1,28 @@
 package main
 
-// Shadow mode: a nested clone that keeps its full history, but whose git dir is
-// parked at <parent>/.git/forkman/<slug>.git instead of <prefix>/.git.
+// Vendored subdirectory forks: shadow mode.
 //
-// Git records a directory containing a .git as a gitlink (mode 160000), so a
-// nested clone cannot have its files tracked by the parent repo. Moving the git
-// dir out of the worktree removes the gitlink without losing the history: the
-// parent sees plain files and pushes them to its own remote, while forkman
-// drives the shadow repo (via --git-dir/--work-tree) to merge upstream with a
-// real merge base.
+// When a vendored copy still has its own .git directory, Git treats it as a
+// submodule gitlink (mode 160000) and refuses to track the plain files inside
+// it. That defeats the point of vendoring.
 //
-// Local edits land in the worktree through the parent repo, so each sync first
-// commits that drift into the shadow repo — that is what gives the upstream
-// merge something to merge against.
+// Instead of deleting the .git (which throws away the entire commit history and
+// forces diff-replay syncing), shadow mode *parks* the .git directory outside
+// the worktree:
+//
+//   vendor/proj/.git  ->  .git/forkman/vendor-proj.git
+//
+// With `core.worktree` pointed back at vendor/proj, the parked repo keeps its
+// full history and upstream remotes, while the parent repo tracks plain files.
+//
+// Syncing in shadow mode:
+//   1. Local edits to vendor/proj/ are committed into the shadow repo's branch.
+//   2. `git merge upstream/<branch>` runs inside the shadow repo with a real
+//      common ancestor.
+//   3. The merged files are staged and committed in the parent repo.
+//
+// The result: upstream history is preserved, merges have real merge bases, and
+// the parent repo holds the one copy that is published.
 
 import (
 	"fmt"
@@ -24,57 +34,47 @@ import (
 
 const localBranchMsg = "forkman: local changes"
 
-// shadowGitDir returns the absolute path of the parked git dir.
+// shadowGitDir returns the repo-relative path where a sub-fork's git dir is parked.
 func shadowGitDir(repo string, sf subFork) string {
-	if sf.GitDir == "" {
-		return filepath.Join(repo, ".git", "forkman", shadowSlug(sf.Prefix)+".git")
-	}
-	if filepath.IsAbs(sf.GitDir) {
+	if sf.GitDir != "" {
 		return sf.GitDir
 	}
-	return filepath.Join(repo, sf.GitDir)
+	slug := strings.Trim(strings.NewReplacer("/", "-", " ", "-").Replace(sf.Prefix), "-")
+	return filepath.Join(".git", "forkman", slug+".git")
 }
 
-func shadowSlug(prefix string) string {
-	return strings.Trim(strings.NewReplacer("/", "-", " ", "-").Replace(prefix), "-")
-}
-
-// shadowArgs prefixes git args so they act on the shadow repo over the
-// subdirectory worktree.
-func shadowArgs(repo string, sf subFork, args []string) []string {
-	return append([]string{
-		"--git-dir=" + shadowGitDir(repo, sf),
-		"--work-tree=" + filepath.Join(repo, sf.Prefix),
-	}, args...)
-}
-
-// gitShadow runs a git command against the shadow repo (honors dryRun).
+// gitShadow runs a git command inside the parked shadow repo.
 func gitShadow(repo string, sf subFork, args ...string) (string, error) {
-	return git(repo, shadowArgs(repo, sf, args)...)
+	gitDir := filepath.Join(repo, shadowGitDir(repo, sf))
+	workTree := filepath.Join(repo, sf.Prefix)
+	return git(repo, append([]string{"--git-dir=" + gitDir, "--work-tree=" + workTree}, args...)...)
 }
 
-// gitShadowRaw runs a git command against the shadow repo, ignoring dryRun.
+// gitShadowRaw is the raw-output counterpart to gitShadow.
 func gitShadowRaw(repo string, sf subFork, args ...string) (string, error) {
-	return gitRaw(repo, shadowArgs(repo, sf, args)...)
+	gitDir := filepath.Join(repo, shadowGitDir(repo, sf))
+	workTree := filepath.Join(repo, sf.Prefix)
+	return gitRaw(repo, append([]string{"--git-dir=" + gitDir, "--work-tree=" + workTree}, args...)...)
 }
 
-// initShadow converts a nested clone at prefix into a shadow-mode sub-fork.
+// shadowCmd returns the git flags a user needs to run manual commands in the shadow repo.
+func shadowCmd(repo string, sf subFork) string {
+	return fmt.Sprintf("git --git-dir=%s --work-tree=%s",
+		filepath.Join(repo, shadowGitDir(repo, sf)),
+		filepath.Join(repo, sf.Prefix))
+}
+
+// initShadow converts a nested clone (which still has .git) into a shadow sub-fork.
 func initShadow(repo, prefix, upstream, remote, branch, tag, ignore string) error {
 	full := filepath.Join(repo, prefix)
 	nested := filepath.Join(full, ".git")
 
-	// A .git *file* means a worktree/submodule pointing elsewhere; relocating
-	// that safely is out of scope.
-	if fi, err := os.Stat(nested); err == nil && !fi.IsDir() {
-		return fmt.Errorf("%s/.git is a file (linked worktree or submodule), not a git dir; "+
-			"forkman cannot relocate it", prefix)
-	}
-
-	gitDirRel := filepath.Join(".git", "forkman", shadowSlug(prefix)+".git")
+	slug := strings.Trim(strings.NewReplacer("/", "-", " ", "-").Replace(prefix), "-")
+	gitDirRel := filepath.Join(".git", "forkman", slug+".git")
 	gitDirAbs := filepath.Join(repo, gitDirRel)
+
 	if mustExist(gitDirAbs) {
-		return fmt.Errorf("%s already exists — %s seems to be registered already; "+
-			"`forkman remove --dir %s` first", gitDirAbs, prefix, prefix)
+		return fmt.Errorf("shadow git dir %s already exists; sub-fork already initialized?", gitDirAbs)
 	}
 
 	if branch != "" && tag != "" {
@@ -120,63 +120,61 @@ func initShadow(repo, prefix, upstream, remote, branch, tag, ignore string) erro
 			return err
 		}
 	}
-	if upstream == "" {
+
+	url := upstream
+	if url == "" {
 		if u, err := gitShadowRaw(repo, sf, "remote", "get-url", remote); err == nil {
-			upstream = u
+			url = u
 		}
 	}
 
-	if tag != "" {
-		if _, err := gitShadowRaw(repo, sf, "fetch", "--force", remote, "tag", tag); err != nil {
-			return fmt.Errorf("fetch tag %s from %s: %w", tag, remote, err)
+	// Default branch: query the shadow repo's own upstream.
+	if branch == "" && tag == "" {
+		if b, err := defaultBranch(shadowGitDir(repo, sf), remote); err == nil {
+			branch = b
+		} else if b, err := gitShadowRaw(repo, sf, "symbolic-ref", "--quiet", "--short", "HEAD"); err == nil {
+			branch = b
+		} else {
+			branch = "main"
 		}
-		sf.Tag = tag
-	} else {
-		if branch == "" {
-			if b, err := gitShadowRaw(repo, sf, "symbolic-ref", "--quiet", "--short", "HEAD"); err == nil && b != "" {
-				branch = b
-			} else {
-				return fmt.Errorf("%s is not on a branch; pass --branch NAME", prefix)
+	}
+
+	// Record configuration in the parent repo's git config.
+	for _, kv := range [][2]string{
+		{"mode", modeShadow},
+		{"remote", remote},
+		{"upstream", url},
+		{"branch", branch},
+		{"tag", tag},
+		{"gitdir", gitDirRel},
+		{"ignore", ignore},
+	} {
+		if kv[1] != "" {
+			if err := gitConfigSet(repo, subKey(prefix, kv[0]), kv[1]); err != nil {
+				return err
 			}
 		}
-		sf.Branch = branch
-	}
-	sf.URL = upstream
-
-	for key, val := range map[string]string{
-		"prefix":   prefix,
-		"mode":     modeShadow,
-		"gitdir":   gitDirRel,
-		"remote":   remote,
-		"upstream": upstream,
-		"branch":   branch,
-		"tag":      tag,
-		"ignore":   ignore,
-	} {
-		if val == "" {
-			continue
-		}
-		if err := gitConfigSet(repo, subKey(prefix, key), val); err != nil {
-			return err
-		}
 	}
 
+	// Ensure the parent repo tracks prefix as plain files, not as a gitlink.
 	staged, err := adoptIntoParent(repo, prefix)
 	if err != nil {
 		return err
 	}
-	if err := registerFork(repo); err != nil {
-		return err
-	}
 
-	fmt.Printf("registered %s (shadow mode, subdirectory of %s)\n", prefix, repo)
-	fmt.Printf("  history:  %s (moved out of the worktree)\n", gitDirRel)
+	fmt.Printf("registered %s/ (shadow mode)\n", prefix)
 	if tag != "" {
-		fmt.Printf("  upstream: %s (tag %s, %s)\n", remote, tag, upstream)
+		fmt.Printf("  upstream: %s (tag %s, %s)\n", remote, tag, url)
 	} else {
-		fmt.Printf("  upstream: %s/%s (%s)\n", remote, branch, upstream)
+		fmt.Printf("  upstream: %s/%s (%s)\n", remote, branch, url)
+	}
+	fmt.Printf("  history:  %s\n", gitDirAbs)
+	if ignore != "" {
+		fmt.Printf("  ignored:  %s\n", ignore)
 	}
 	if staged {
+		fmt.Printf("  committed %s as plain files in parent repo\n", prefix)
+	} else {
 		fmt.Printf("  %s is now tracked by the parent as plain files — commit and `git push` as usual.\n", prefix)
 	}
 	fmt.Printf("run `forkman sync` to merge upstream changes into %s.\n", prefix)
@@ -220,45 +218,47 @@ func restoreIgnoredInShadow(repo string, sf subFork, baseCommit string, patterns
 
 	fileSet := make(map[string]bool)
 	for _, out := range []string{diffOut, cachedDiffOut} {
-		for _, f := range strings.Split(out, "\n") {
-			f = strings.TrimSpace(f)
+		for _, line := range strings.Split(out, "\n") {
+			f := strings.TrimSpace(line)
 			if f != "" {
 				fileSet[f] = true
 			}
 		}
 	}
 
-	for f := range fileSet {
-		if !pathMatchesIgnore(f, patterns) {
-			continue
-		}
-
-		if _, err := gitShadowRaw(repo, sf, "cat-file", "-e", baseCommit+":"+f); err == nil {
-			if _, err := gitShadowRaw(repo, sf, "checkout", baseCommit, "--", f); err != nil {
-				return fmt.Errorf("restoring %s in shadow repo: %w", f, err)
+	fullPrefix := filepath.Join(repo, sf.Prefix)
+	for file := range fileSet {
+		if pathMatchesIgnore(file, patterns) {
+			if _, err := gitShadowRaw(repo, sf, "cat-file", "-e", baseCommit+":"+file); err == nil {
+				_, _ = gitShadowRaw(repo, sf, "checkout", baseCommit, "--", file)
+				_, _ = gitShadowRaw(repo, sf, "add", "--", file)
+			} else {
+				_, _ = gitShadowRaw(repo, sf, "rm", "-f", "--cached", "--ignore-unmatch", "--", file)
+				_ = os.Remove(filepath.Join(fullPrefix, filepath.FromSlash(file)))
 			}
-			_, _ = gitShadowRaw(repo, sf, "add", "--", f)
-		} else {
-			_, _ = gitShadowRaw(repo, sf, "rm", "-f", "--cached", "--ignore-unmatch", "--", f)
-			fullPath := filepath.Join(repo, sf.Prefix, filepath.FromSlash(f))
-			_ = os.Remove(fullPath)
 		}
 	}
-
-	for _, p := range patterns {
-		_, _ = gitShadowRaw(repo, sf, "clean", "-fdq", "--", p)
-	}
-
 	return nil
 }
 
-// syncShadow merges upstream into a shadow-mode subdirectory, then commits the
-// resulting file changes in the parent repo.
-func syncShadow(repo string, sf subFork, opt syncOptions) syncResult {
-	res := syncResult{Repo: repo + " [" + sf.Prefix + "]"}
+// restoreShadow moves the parked git dir back into prefix/.git.
+func restoreShadow(repo string, sf subFork) error {
+	gitDirAbs := filepath.Join(repo, shadowGitDir(repo, sf))
+	nested := filepath.Join(repo, sf.Prefix, ".git")
+	if !mustExist(gitDirAbs) {
+		return nil
+	}
+	// Clear the worktree config before putting it back.
+	_, _ = gitRaw(repo, "--git-dir="+gitDirAbs, "config", "--unset", "core.worktree")
+	return os.Rename(gitDirAbs, nested)
+}
 
-	if !mustExist(shadowGitDir(repo, sf)) {
-		res.Status, res.Detail = "error", "shadow git dir missing: "+shadowGitDir(repo, sf)
+// syncShadow runs the sync pipeline inside a shadow sub-fork.
+func syncShadow(repo string, sf subFork, opt syncOptions) (res syncResult) {
+	res = syncResult{Repo: repo + " [" + sf.Prefix + "]"}
+
+	if !mustExist(filepath.Join(repo, shadowGitDir(repo, sf))) {
+		res.Status, res.Detail = "error", "shadow git dir missing; run `forkman init --dir "+sf.Prefix+"` again"
 		return res
 	}
 
@@ -270,11 +270,34 @@ func syncShadow(repo string, sf subFork, opt syncOptions) syncResult {
 
 	var upstreamRef string
 	targetTag := opt.Tag
-	if targetTag == "" {
+
+	prevTag := sf.Tag
+	res.PrevTag = prevTag
+
+	effectiveMode := opt.Mode
+	if effectiveMode == "" && targetTag == "" {
+		effectiveMode, _ = gitConfigGet(repo, subKey(sf.Prefix, "syncMode"))
+	}
+
+	if effectiveMode == modeSemanticTags {
+		latestTag, err := findLatestSemanticTagShadow(repo, sf, opt.TagPattern)
+		if err != nil {
+			res.Status, res.Detail = "error", err.Error()
+			return res
+		}
+		targetTag = latestTag
+		res.Tag = latestTag
+	} else if effectiveMode == modeLatestRev {
+		targetTag = ""
+	} else if targetTag == "" {
 		targetTag = sf.Tag
 	}
 
 	if targetTag != "" {
+		res.Tag = targetTag
+		if prevTag != targetTag {
+			res.UpgradeType = semverUpgradeType(prevTag, targetTag)
+		}
 		if _, err := gitShadow(repo, sf, "fetch", "--force", sf.Remote, "tag", targetTag); err != nil {
 			res.Status, res.Detail = "error", "fetch failed: "+err.Error()
 			return res
@@ -300,7 +323,11 @@ func syncShadow(repo string, sf subFork, opt syncOptions) syncResult {
 		if len(patterns) > 0 {
 			ignoreMsg = fmt.Sprintf(" (ignoring %d pattern(s))", len(patterns))
 		}
-		res.Detail = fmt.Sprintf("would %s %s into %s/ (shadow)%s", strategyVerb(opt), upstreamRef, sf.Prefix, ignoreMsg)
+		upgradeMsg := ""
+		if res.UpgradeType != "" {
+			upgradeMsg = fmt.Sprintf(" [%s upgrade]", res.UpgradeType)
+		}
+		res.Detail = fmt.Sprintf("would %s %s into %s/ (shadow)%s%s", strategyVerb(opt), upstreamRef, sf.Prefix, ignoreMsg, upgradeMsg)
 		return res
 	}
 
@@ -319,7 +346,11 @@ func syncShadow(repo string, sf subFork, opt syncOptions) syncResult {
 
 	ahead, behind, err := aheadBehindShadow(repo, sf, upstreamRef)
 	if err == nil && behind == 0 {
+		if !dryRun && effectiveMode == modeSemanticTags && targetTag != "" {
+			_ = gitConfigSet(repo, subKey(sf.Prefix, "tag"), targetTag)
+		}
 		res.Status = "up-to-date"
+		res.UpgradeType = ""
 		res.Detail = fmt.Sprintf("%s/ ahead %d of %s", sf.Prefix, ahead, upstreamRef)
 		return res
 	}
@@ -340,7 +371,7 @@ func syncShadow(repo string, sf subFork, opt syncOptions) syncResult {
 		if mergeErr != nil {
 			out, _ := gitShadowRaw(repo, sf, "diff", "--name-only", "--diff-filter=U")
 			conflicts := strings.Split(strings.TrimSpace(out), "\n")
-			allConflictsIgnored := len(conflicts) > 0 && conflicts[0] != ""
+			allConflictsIgnored := len(conflicts) > 0
 			for _, c := range conflicts {
 				if c != "" && !pathMatchesIgnore(c, patterns) {
 					allConflictsIgnored = false
@@ -348,6 +379,7 @@ func syncShadow(repo string, sf subFork, opt syncOptions) syncResult {
 				}
 			}
 			if allConflictsIgnored {
+				fullPrefix := filepath.Join(repo, sf.Prefix)
 				for _, c := range conflicts {
 					if c == "" {
 						continue
@@ -357,7 +389,7 @@ func syncShadow(repo string, sf subFork, opt syncOptions) syncResult {
 						_, _ = gitShadowRaw(repo, sf, "add", "--", c)
 					} else {
 						_, _ = gitShadowRaw(repo, sf, "rm", "-f", "--cached", "--ignore-unmatch", "--", c)
-						_ = os.Remove(filepath.Join(repo, sf.Prefix, filepath.FromSlash(c)))
+						_ = os.Remove(filepath.Join(fullPrefix, filepath.FromSlash(c)))
 					}
 				}
 				mergeErr = nil
@@ -389,8 +421,12 @@ func syncShadow(repo string, sf subFork, opt syncOptions) syncResult {
 			return res
 		}
 		res.Status = "CONFLICT"
-		res.Detail = fmt.Sprintf("parked upstream in %q — resolve with: %s merge %s",
-			parked, shadowCmd(repo, sf), parked)
+		upgradeInfo := ""
+		if res.UpgradeType != "" {
+			upgradeInfo = fmt.Sprintf(" (%s upgrade)", res.UpgradeType)
+		}
+		res.Detail = fmt.Sprintf("parked upstream in %q%s — resolve with: %s merge %s",
+			parked, upgradeInfo, shadowCmd(repo, sf), parked)
 		return res
 	}
 
@@ -401,6 +437,9 @@ func syncShadow(repo string, sf subFork, opt syncOptions) syncResult {
 	}
 	staged, _ := gitRaw(repo, "diff", "--cached", "--name-only", "--", sf.Prefix)
 	if strings.TrimSpace(staged) == "" {
+		if !dryRun && effectiveMode == modeSemanticTags && targetTag != "" {
+			_ = gitConfigSet(repo, subKey(sf.Prefix, "tag"), targetTag)
+		}
 		res.Status = fmt.Sprintf("merged %d", behind)
 		res.Detail = fmt.Sprintf("from %s (no file changes in %s/)", upstreamRef, sf.Prefix)
 		return res
@@ -411,8 +450,20 @@ func syncShadow(repo string, sf subFork, opt syncOptions) syncResult {
 		return res
 	}
 
+	if !dryRun && effectiveMode == modeSemanticTags && targetTag != "" {
+		_ = gitConfigSet(repo, subKey(sf.Prefix, "tag"), targetTag)
+	}
+
 	res.Status = fmt.Sprintf("merged %d", behind)
-	res.Detail = fmt.Sprintf("from %s into %s/ — `git push` to publish", upstreamRef, sf.Prefix)
+	if res.UpgradeType != "" {
+		if prevTag != "" && prevTag != targetTag {
+			res.Detail = fmt.Sprintf("from %s into %s/ (%s upgrade: %s -> %s) — `git push` to publish", upstreamRef, sf.Prefix, res.UpgradeType, prevTag, targetTag)
+		} else {
+			res.Detail = fmt.Sprintf("from %s into %s/ (%s upgrade) — `git push` to publish", upstreamRef, sf.Prefix, res.UpgradeType)
+		}
+	} else {
+		res.Detail = fmt.Sprintf("from %s into %s/ — `git push` to publish", upstreamRef, sf.Prefix)
+	}
 	return res
 }
 
@@ -423,31 +474,4 @@ func aheadBehindShadow(repo string, sf subFork, upstreamRef string) (ahead, behi
 		return 0, 0, err
 	}
 	return parseAheadBehind(out)
-}
-
-// shadowCmd renders the git invocation a user needs to drive the shadow repo.
-func shadowCmd(repo string, sf subFork) string {
-	return fmt.Sprintf("git --git-dir=%s --work-tree=%s",
-		shadowGitDir(repo, sf), filepath.Join(repo, sf.Prefix))
-}
-
-// removeShadow moves the git dir back into the subdirectory, restoring an
-// ordinary nested clone. The parent keeps tracking the files it has committed.
-func restoreShadow(repo string, sf subFork) error {
-	gitDirAbs := shadowGitDir(repo, sf)
-	if !mustExist(gitDirAbs) {
-		return nil
-	}
-	dest := filepath.Join(repo, sf.Prefix, ".git")
-	if mustExist(dest) {
-		return fmt.Errorf("%s already exists; leaving %s in place", dest, gitDirAbs)
-	}
-	if err := os.Rename(gitDirAbs, dest); err != nil {
-		return err
-	}
-	if _, err := gitRaw(repo, "--git-dir="+dest, "--work-tree="+filepath.Join(repo, sf.Prefix),
-		"config", "--unset", "core.worktree"); err != nil {
-		return err
-	}
-	return nil
 }

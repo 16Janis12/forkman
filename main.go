@@ -15,9 +15,9 @@ import (
 const usage = `forkman — manage your private forks
 
 Usage:
-  forkman init   [--upstream URL] [--remote NAME] [--branch NAME] [--tag TAG] [--ignore PATTERNS]
+  forkman init   [--upstream URL] [--remote NAME] [--branch NAME] [--tag TAG] [--mode MODE] [--ignore PATTERNS]
                  [--dir SUBDIR [--base REF]]
-  forkman sync   [--all] [--rebase] [--tag TAG] [--dry-run] [PATH...]
+  forkman sync   [--all] [--rebase] [--tag TAG] [--mode MODE] [--tag-pattern PATTERN] [--dry-run] [PATH...]
   forkman list
   forkman status [PATH]
   forkman ignore [--dir SUBDIR] [add|remove] [PATTERN]
@@ -25,6 +25,7 @@ Usage:
 
 Commands:
   init    Register the current repo and attach its upstream (original) remote.
+          With --mode, choose default sync mode: 'latest' (latest-rev) or 'tags' (semantic-tags).
           With --tag, track a specific upstream tag instead of a branch.
           With --dir, register a vendored subdirectory instead — a copy of an
           upstream repo living inside this one. Two modes, picked automatically:
@@ -36,6 +37,10 @@ Commands:
           With --ignore, specify folders or files to keep local and ignore from sync.
   sync    Fetch upstream and merge it in. On conflict, park upstream in a
           branch (fork-sync/<branch>-<date>) and leave your branch untouched.
+          With --mode, specify sync mode:
+            latest (or latest-rev)     sync against the tip of upstream branch
+            semantic-tags (or tags)    sync against latest semantic tag (v?[0-9]+\.[0-9]+\.[0-9]+)
+          With --tag-pattern, specify a custom regex pattern for semantic tags.
           With --tag, sync to a specific upstream tag instead of the tracked branch.
           Vendored subdirectories sync per their mode; either way the result is
           committed to the parent, so "git push" there publishes everything.
@@ -88,6 +93,7 @@ func cmdInit(args []string) error {
 	remote := fs.String("remote", "upstream", "name for the upstream remote")
 	branch := fs.String("branch", "", "upstream branch to track (default: its HEAD)")
 	tag := fs.String("tag", "", "upstream tag to track")
+	mode := fs.String("mode", "", "sync mode: 'latest' (latest-rev) or 'tags' (semantic-tags)")
 	dir := fs.String("dir", "", "register a vendored subdirectory instead of the whole repo")
 	base := fs.String("base", "", "with --dir: upstream commit the copy matches (default: current tip)")
 	ignore := fs.String("ignore", "", "comma-separated folder/file patterns to ignore from upstream sync")
@@ -99,6 +105,11 @@ func cmdInit(args []string) error {
 		return fmt.Errorf("cannot specify both --branch and --tag")
 	}
 
+	normMode, err := normalizeMode(*mode)
+	if err != nil {
+		return err
+	}
+
 	repo, err := repoRoot(".")
 	if err != nil {
 		return err
@@ -106,7 +117,17 @@ func cmdInit(args []string) error {
 	repo = absClean(repo)
 
 	if *dir != "" {
-		return initSub(repo, *dir, *upstream, *remote, *branch, cleanTagVal, *base, *ignore)
+		err := initSub(repo, *dir, *upstream, *remote, *branch, cleanTagVal, *base, *ignore)
+		if err != nil {
+			return err
+		}
+		if normMode != "" {
+			prefix, _ := relPrefix(repo, *dir)
+			if prefix != "" {
+				_ = gitConfigSet(repo, subKey(prefix, "syncMode"), normMode)
+			}
+		}
+		return nil
 	}
 	if *base != "" {
 		return fmt.Errorf("--base only applies together with --dir")
@@ -144,6 +165,11 @@ func cmdInit(args []string) error {
 			return err
 		}
 	}
+	if normMode != "" {
+		if err := gitConfigSet(repo, "fork.syncMode", normMode); err != nil {
+			return err
+		}
+	}
 	if cleanTagVal != "" {
 		if err := gitConfigSet(repo, "fork.upstreamTag", cleanTagVal); err != nil {
 			return err
@@ -176,6 +202,9 @@ func cmdInit(args []string) error {
 	} else {
 		fmt.Printf("  upstream: %s (%s)\n", *remote, url)
 	}
+	if normMode != "" {
+		fmt.Printf("  mode:     %s\n", normMode)
+	}
 	if *ignore != "" {
 		fmt.Printf("  ignored:  %s\n", *ignore)
 	}
@@ -188,8 +217,15 @@ func cmdSync(args []string) error {
 	all := fs.Bool("all", false, "sync every registered fork")
 	rebase := fs.Bool("rebase", false, "rebase onto upstream instead of merging")
 	tag := fs.String("tag", "", "sync to a specific upstream tag")
+	mode := fs.String("mode", "", "sync mode: 'latest' (latest-rev) or 'tags' (semantic-tags)")
+	tagPattern := fs.String("tag-pattern", defaultTagPattern, "regex pattern for semantic tags")
 	fs.BoolVar(&dryRun, "dry-run", false, "print git commands without mutating")
 	fs.Parse(args)
+
+	normMode, err := normalizeMode(*mode)
+	if err != nil {
+		return err
+	}
 
 	var repos []string
 	switch {
@@ -218,7 +254,14 @@ func cmdSync(args []string) error {
 		repos = []string{absClean(root)}
 	}
 
-	if runSync(repos, syncOptions{Rebase: *rebase, Tag: cleanTag(*tag)}) {
+	opt := syncOptions{
+		Rebase:     *rebase,
+		Tag:        cleanTag(*tag),
+		Mode:       normMode,
+		TagPattern: *tagPattern,
+	}
+
+	if runSync(repos, opt) {
 		os.Exit(1)
 	}
 	return nil
@@ -251,7 +294,9 @@ func cmdList(args []string) error {
 			up, br := "?", "?"
 			if cfg, err := loadForkConfig(repo); err == nil {
 				up = cfg.URL
-				if cfg.Tag != "" {
+				if cfg.Mode == modeSemanticTags {
+					br = "semver"
+				} else if cfg.Tag != "" {
 					br = "tag:" + cfg.Tag
 				} else {
 					br = cfg.Branch
@@ -262,7 +307,10 @@ func cmdList(args []string) error {
 		subs, _ := loadSubForks(repo)
 		for _, sf := range subs {
 			target := sf.Branch
-			if sf.Tag != "" {
+			subSyncMode, _ := gitConfigGet(repo, subKey(sf.Prefix, "syncMode"))
+			if subSyncMode == modeSemanticTags {
+				target = "semver"
+			} else if sf.Tag != "" {
 				target = "tag:" + sf.Tag
 			}
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
@@ -295,8 +343,22 @@ func cmdStatus(args []string) error {
 		if err != nil {
 			return err
 		}
+		if cfg.Mode != "" {
+			fmt.Printf("mode:     %s\n", cfg.Mode)
+		}
 		var upstreamRef string
-		if cfg.Tag != "" {
+		if cfg.Mode == modeSemanticTags {
+			latestTag, err := findLatestSemanticTag(repo, cfg.Remote, "")
+			if err == nil {
+				upstreamRef = "tags/" + latestTag
+				fmt.Printf("upstream: %s (%s) [latest semantic tag]\n", upstreamRef, cfg.URL)
+				if !dryRun {
+					_, _ = gitRaw(repo, "fetch", "--force", cfg.Remote, "tag", latestTag)
+				}
+			} else {
+				fmt.Printf("upstream: semantic-tags (%s) [%v]\n", cfg.URL, err)
+			}
+		} else if cfg.Tag != "" {
 			upstreamRef = "tags/" + cfg.Tag
 			fmt.Printf("upstream: %s (%s)\n", upstreamRef, cfg.URL)
 			if !dryRun {
@@ -309,8 +371,10 @@ func cmdStatus(args []string) error {
 				_, _ = gitRaw(repo, "fetch", cfg.Remote, cfg.Branch)
 			}
 		}
-		if ahead, behind, err := aheadBehind(repo, upstreamRef, "HEAD"); err == nil {
-			fmt.Printf("divergence: %d ahead, %d behind %s\n", ahead, behind, upstreamRef)
+		if upstreamRef != "" {
+			if ahead, behind, err := aheadBehind(repo, upstreamRef, "HEAD"); err == nil {
+				fmt.Printf("divergence: %d ahead, %d behind %s\n", ahead, behind, upstreamRef)
+			}
 		}
 		patterns := loadIgnorePatterns(repo, repo, "fork.ignore")
 		if len(patterns) > 0 {
@@ -350,6 +414,7 @@ func cmdStatus(args []string) error {
 			continue
 		}
 
+		// Replay mode divergence.
 		if !dryRun {
 			if sf.Tag != "" {
 				_, _ = gitRaw(repo, "fetch", "--force", sf.Remote, "tag", sf.Tag)
@@ -492,6 +557,7 @@ func cmdIgnore(args []string) error {
 func cmdRemove(args []string) error {
 	fs := flag.NewFlagSet("remove", flag.ExitOnError)
 	dir := fs.String("dir", "", "unregister only this vendored subdirectory")
+	fs.BoolVar(&dryRun, "dry-run", false, "print git commands without mutating")
 	fs.Parse(args)
 
 	target := "."

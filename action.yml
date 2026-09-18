@@ -1,0 +1,146 @@
+name: 'Forkman Sync'
+description: 'Keep private forks in sync with upstream using forkman (supports latest rev or semantic tags)'
+author: 'forkman'
+
+inputs:
+  mode:
+    description: "Sync mode: 'latest' (or 'latest-rev') to sync latest upstream branch revision, or 'semantic-tags' (or 'tags') to sync latest semantic tag matching v?[0-9]+\\.[0-9]+\\.[0-9]+"
+    required: false
+    default: 'latest'
+  upstream:
+    description: 'Upstream repository URL (if not already configured in fork)'
+    required: false
+    default: ''
+  remote:
+    description: 'Upstream remote name'
+    required: false
+    default: 'upstream'
+  branch:
+    description: 'Upstream branch to track for latest revision mode (default: upstream default branch)'
+    required: false
+    default: ''
+  tag-pattern:
+    description: 'Regex pattern for semantic tags (default: v?[0-9]+\\.[0-9]+\\.[0-9]+)'
+    required: false
+    default: 'v?[0-9]+\\.[0-9]+\\.[0-9]+'
+  dir:
+    description: 'Vendored subdirectory to sync (for vendored sub-fork mode)'
+    required: false
+    default: ''
+  base:
+    description: 'Base upstream commit for replay mode (used with dir)'
+    required: false
+    default: ''
+  ignore:
+    description: 'Comma-separated patterns to ignore from upstream changes'
+    required: false
+    default: ''
+  rebase:
+    description: 'Rebase onto upstream instead of merging'
+    required: false
+    default: 'false'
+  dry-run:
+    description: 'Print git commands without mutating anything'
+    required: false
+    default: 'false'
+  push:
+    description: 'Push synced commits and any parked conflict branches to origin'
+    required: false
+    default: 'false'
+
+outputs:
+  status:
+    description: 'Sync status: up-to-date, merged, CONFLICT, or error'
+    value: ${{ steps.sync.outputs.status }}
+  tag:
+    description: 'The tag that was synced to (if semantic-tags mode was used)'
+    value: ${{ steps.sync.outputs.tag }}
+  upgrade-type:
+    description: 'Type of semantic version upgrade: MAJOR, MINOR, PATCH, or empty'
+    value: ${{ steps.sync.outputs.upgrade_type }}
+  synced:
+    description: 'Whether changes were merged/synced (true/false)'
+    value: ${{ steps.sync.outputs.synced }}
+  parked-branch:
+    description: 'The parked conflict branch name if a conflict occurred'
+    value: ${{ steps.sync.outputs.parked_branch }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Configure Git Author
+      shell: bash
+      run: |
+        if [ -z "$(git config user.name)" ]; then
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+        fi
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.20'
+        cache: false
+
+    - name: Build forkman CLI
+      shell: bash
+      run: |
+        cd ${{ github.action_path }}
+        go build -o /tmp/forkman .
+
+    - name: Initialize Fork (if upstream provided and not configured)
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.upstream }}" ]; then
+          INIT_ARGS="--upstream ${{ inputs.upstream }} --remote ${{ inputs.remote }} --mode ${{ inputs.mode }}"
+          if [ -n "${{ inputs.branch }}" ]; then
+            INIT_ARGS="$INIT_ARGS --branch ${{ inputs.branch }}"
+          fi
+          if [ -n "${{ inputs.dir }}" ]; then
+            INIT_ARGS="$INIT_ARGS --dir ${{ inputs.dir }}"
+            if [ -n "${{ inputs.base }}" ]; then
+              INIT_ARGS="$INIT_ARGS --base ${{ inputs.base }}"
+            fi
+          fi
+          if [ -n "${{ inputs.ignore }}" ]; then
+            INIT_ARGS="$INIT_ARGS --ignore \"${{ inputs.ignore }}\""
+          fi
+          eval "/tmp/forkman init $INIT_ARGS"
+        fi
+
+    - name: Run forkman sync
+      id: sync
+      shell: bash
+      run: |
+        SYNC_ARGS="--mode ${{ inputs.mode }}"
+        if [ -n "${{ inputs.tag-pattern }}" ]; then
+          SYNC_ARGS="$SYNC_ARGS --tag-pattern \"${{ inputs.tag-pattern }}\""
+        fi
+        if [ "${{ inputs.rebase }}" = "true" ]; then
+          SYNC_ARGS="$SYNC_ARGS --rebase"
+        fi
+        if [ "${{ inputs.dry-run }}" = "true" ]; then
+          SYNC_ARGS="$SYNC_ARGS --dry-run"
+        fi
+
+        set +e
+        eval "/tmp/forkman sync $SYNC_ARGS"
+        EXIT_CODE=$?
+        echo "sync_exit_code=$EXIT_CODE" >> $GITHUB_ENV
+        exit $EXIT_CODE
+
+    - name: Push Synced Changes & Parked Branches
+      if: inputs.push == 'true' && always()
+      shell: bash
+      run: |
+        CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+        if [ "${{ steps.sync.outputs.synced }}" = "true" ]; then
+          echo "Pushing synced changes on $CURRENT_BRANCH..."
+          git push origin "$CURRENT_BRANCH"
+        fi
+
+        PARKED="${{ steps.sync.outputs.parked_branch }}"
+        if [ -n "$PARKED" ]; then
+          echo "Pushing parked conflict branch $PARKED..."
+          git push -f origin "$PARKED"
+        fi
